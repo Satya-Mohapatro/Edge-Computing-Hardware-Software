@@ -7,7 +7,7 @@ This project demonstrates **real-time face detection** using OpenCV’s Haar Cas
 - Fast and lightweight (runs on CPU/GPU)
 - Uses pre-trained Haar Cascade model
 
-## ⚙️ Setup Instructions
+## Setup Instructions
 
 ###  Update system
 ```bash
@@ -37,7 +37,7 @@ python3 face_detection.py
 - Haarcascade model: [haarcascade_frontalface_default.xml](https://github.com/opencv/opencv/blob/master/data/haarcascades/haarcascade_frontalface_default.xml)
 - Optional test dataset: [LFW Dataset](http://vis-www.cs.umass.edu/lfw/)
 
-## 🧠 Future Improvements
+## Future Improvements
 - Add eye detection, smile detection
 - Integrate with face recognition model (e.g., LBPH / Dlib)
 - Deploy via Jetson container with Docker
