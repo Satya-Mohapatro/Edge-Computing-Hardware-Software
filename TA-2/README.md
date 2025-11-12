@@ -8,7 +8,7 @@ This project demonstrates **real-time person detection** using a **deep learning
 - Optimized for Jetson Nano/Orin GPU
 - Detects "person" class with bounding boxes
 
-## ⚙️ Setup Instructions
+##  Setup Instructions
 
 ###  Install Dependencies
 ```bash
