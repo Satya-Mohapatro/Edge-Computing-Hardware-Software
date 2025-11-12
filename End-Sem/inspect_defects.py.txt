@@ -1,0 +1,366 @@
+mport cv2
+from ultralytics import YOLO
+import paho.mqtt.client as mqtt
+import time
+import json
+from collections import defaultdict
+import os
+
+# ============ CONFIGURATION ============
+
+# Model settings
+MODEL_PATH = 'best.engine'  # TensorRT optimized model
+CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for detection (0.0-1.0)
+
+# Video source options:
+VIDEO_SOURCE = 0  # USB camera (try 0, 1, or 2)
+# VIDEO_SOURCE = 'rtsp://username:password@camera-ip:554/stream'  # Network camera
+# VIDEO_SOURCE = 'test_video.mp4'  # Video file for testing
+
+# Camera settings
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CAMERA_FPS = 30
+
+# NEU Metal Surface Defect Classes
+DEFECT_CLASSES = [
+    'crazing',           # Fine cracks from thermal stress
+    'inclusion',         # Foreign material embedded in surface
+    'patches',           # Irregular surface areas
+    'pitted_surface',    # Small cavities or depressions
+    'rolled-in_scale',   # Oxidation debris pressed into surface
+    'scratches'          # Linear surface marks
+]
+
+# Detection parameters
+DEFECT_CONFIRMATION_FRAMES = 3  # Must see defect for 3 consecutive frames
+INSPECTION_INTERVAL = 0.5       # Seconds between inspections (0 = every frame)
+
+# Alert settings
+MQTT_BROKER = "broker.hivemq.com"  # Public MQTT broker
+MQTT_PORT = 1883
+MQTT_TOPIC = "factory/steel/defects"
+ALERT_COOLDOWN = 5.0  # Minimum seconds between alerts for same defect type
+
+# Display settings
+SHOW_DISPLAY = False  # Set to True if you have monitor connected
+SAVE_DEFECT_IMAGES = True  # Save images of detected defects
+
+# Statistics reporting
+STATS_REPORT_INTERVAL = 60  # Report statistics every 60 seconds
+
+# ============ MQTT SETUP ============
+print("🔄 Connecting to MQTT broker...")
+mqtt_client = mqtt.Client()
+
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.loop_start()
+    print(f"✅ Connected to MQTT broker: {MQTT_BROKER}")
+except Exception as e:
+    print(f"⚠️  MQTT connection failed: {e}")
+    print("⚠️  Continuing without MQTT alerts (detection will still work)")
+
+# ============ LOAD MODEL ============
+print(f"🔄 Loading model: {MODEL_PATH}")
+try:
+    model = YOLO(MODEL_PATH, task='detect')
+    print("✅ Model loaded successfully")
+    print(f"📋 Defect classes: {model.names}")
+except Exception as e:
+    print(f"❌ Failed to load model: {e}")
+    print("💡 Make sure best.engine exists in current directory")
+    print("💡 If not, run: yolo export model=best.pt format=engine half=True")
+    exit(1)
+
+# ============ VIDEO CAPTURE ============
+print(f"🔄 Opening video source: {VIDEO_SOURCE}")
+cap = cv2.VideoCapture(VIDEO_SOURCE)
+
+if not cap.isOpened():
+    print("❌ Failed to open video source")
+    print("💡 For USB camera, try VIDEO_SOURCE = 0, 1, or 2")
+    print("💡 Check camera connection: ls /dev/video*")
+    exit(1)
+
+# Set camera properties
+if isinstance(VIDEO_SOURCE, int):
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+
+print("✅ Video source opened successfully")
+
+# ============ STATE TRACKING ============
+class InspectionState:
+    """Tracks inspection state and statistics"""
+    def __init__(self):
+        # Detection tracking
+        self.defect_frame_counters = defaultdict(int)  # Count consecutive frames with defect
+        self.confirmed_defects = set()  # Currently confirmed defects
+        self.last_alert_time = defaultdict(float)  # Last alert time per defect type
+        
+        # Statistics
+        self.total_frames = 0
+        self.total_inspections = 0
+        self.total_defects = 0
+        self.defect_counts = defaultdict(int)  # Count per defect type
+        
+        # Timing
+        self.last_inspection_time = 0
+        self.last_stats_report = time.time()
+        self.fps_history = []
+        
+state = InspectionState()
+
+# Create output directory for defect images
+if SAVE_DEFECT_IMAGES:
+    os.makedirs('defect_images', exist_ok=True)
+    print("✅ Defect image directory created")
+
+# ============ HELPER FUNCTIONS ============
+
+def send_alert(defect_type, confidence, frame_number):
+    """Send MQTT alert for detected defect"""
+    alert_data = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "defect_type": defect_type,
+        "confidence": round(float(confidence), 3),
+        "frame": frame_number,
+        "camera_id": "station_01",
+        "total_defects_session": state.total_defects
+    }
+    
+    try:
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(alert_data))
+        print(f"🚨 ALERT SENT: {defect_type} (confidence: {confidence:.2%})")
+    except Exception as e:
+        print(f"🚨 DEFECT DETECTED: {defect_type} (confidence: {confidence:.2%})")
+        print(f"   (MQTT publish failed: {e})")
+
+def save_defect_image(frame, defect_type, confidence, frame_number):
+    """Save image of detected defect"""
+    if not SAVE_DEFECT_IMAGES:
+        return None
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"defect_images/{timestamp}_{defect_type}_{int(confidence*100)}.jpg"
+    
+    try:
+        cv2.imwrite(filename, frame)
+        print(f"💾 Saved: {filename}")
+        return filename
+    except Exception as e:
+        print(f"⚠️  Failed to save image: {e}")
+        return None
+
+def report_statistics():
+    """Print inspection statistics"""
+    if state.total_inspections == 0:
+        defect_rate = 0
+    else:
+        defect_rate = (state.total_defects / state.total_inspections) * 100
+    
+    avg_fps = sum(state.fps_history[-30:]) / len(state.fps_history[-30:]) if state.fps_history else 0
+    
+    print("\n" + "="*60)
+    print(f"📊 STATISTICS (Last {STATS_REPORT_INTERVAL}s)")
+    print("="*60)
+    print(f"Total frames: {state.total_frames}")
+    print(f"Inspections: {state.total_inspections}")
+    print(f"Defects found: {state.total_defects}")
+    print(f"Defect rate: {defect_rate:.2f}%")
+    print(f"Average FPS: {avg_fps:.1f}")
+    
+    if state.defect_counts:
+        print(f"\nDefects by type:")
+        for defect_type, count in sorted(state.defect_counts.items()):
+            print(f"  - {defect_type}: {count}")
+    
+    print("="*60 + "\n")
+
+# ============ MAIN INSPECTION LOOP ============
+print("\n" + "="*70)
+print("🚀 METAL SURFACE DEFECT DETECTION SYSTEM ACTIVE")
+print("="*70)
+print(f"Model: {MODEL_PATH}")
+print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
+print(f"Defect confirmation: {DEFECT_CONFIRMATION_FRAMES} consecutive frames")
+print(f"Alert cooldown: {ALERT_COOLDOWN} seconds")
+print(f"Defect classes: {', '.join(DEFECT_CLASSES)}")
+print("="*70)
+print("\n💡 Press Ctrl+C to stop\n")
+
+frame_start_time = time.time()
+fps_frame_count = 0
+
+try:
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("⚠️  Failed to read frame - retrying...")
+            time.sleep(1)
+            continue
+        
+        state.total_frames += 1
+        fps_frame_count += 1
+        current_time = time.time()
+        
+        # Calculate FPS every 30 frames
+        if fps_frame_count >= 30:
+            elapsed = current_time - frame_start_time
+            fps = fps_frame_count / elapsed
+            state.fps_history.append(fps)
+            frame_start_time = current_time
+            fps_frame_count = 0
+        
+        # Check if it's time to inspect (based on INSPECTION_INTERVAL)
+        if current_time - state.last_inspection_time < INSPECTION_INTERVAL:
+            if SHOW_DISPLAY:
+                cv2.imshow('Metal Defect Detection', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            continue
+        
+        state.last_inspection_time = current_time
+        state.total_inspections += 1
+        
+        # ============ RUN INFERENCE ============
+        results = model(frame, verbose=False, conf=CONFIDENCE_THRESHOLD)
+        
+        # Process detections
+        detected_defects = set()
+        best_detections = {}  # Store highest confidence detection per class
+        
+        for r in results:
+            boxes = r.boxes
+            
+            for box in boxes:
+                class_id = int(box.cls[0])
+                class_name = model.names[class_id]
+                confidence = float(box.conf[0])
+                coords = box.xyxy[0].cpu().numpy()
+                
+                # Track defects
+                if class_name in DEFECT_CLASSES:
+                    detected_defects.add(class_name)
+                    
+                    # Keep highest confidence detection for each class
+                    if class_name not in best_detections or \
+                       confidence > best_detections[class_name]['conf']:
+                        best_detections[class_name] = {
+                            'conf': confidence,
+                            'coords': coords
+                        }
+                    
+                    # Draw bounding box if display enabled
+                    if SHOW_DISPLAY:
+                        x1, y1, x2, y2 = map(int, coords)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        label = f"{class_name}: {confidence:.2f}"
+                        cv2.putText(frame, label, (x1, y1-10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        # ============ MULTI-FRAME CONFIRMATION ============
+        
+        # Update frame counters for each defect type
+        for defect_class in DEFECT_CLASSES:
+            if defect_class in detected_defects:
+                state.defect_frame_counters[defect_class] += 1
+            else:
+                state.defect_frame_counters[defect_class] = 0
+        
+        # Check for confirmed defects (seen in multiple consecutive frames)
+        for defect_class, count in state.defect_frame_counters.items():
+            if count >= DEFECT_CONFIRMATION_FRAMES:
+                # Defect confirmed!
+                time_since_last_alert = current_time - state.last_alert_time[defect_class]
+                
+                # Check alert cooldown
+                if time_since_last_alert > ALERT_COOLDOWN:
+                    detection = best_detections[defect_class]
+                    
+                    # Save defect image
+                    save_defect_image(frame, defect_class, detection['conf'], state.total_frames)
+                    
+                    # Send alert
+                    send_alert(defect_class, detection['conf'], state.total_frames)
+                    
+                    # Update statistics
+                    state.total_defects += 1
+                    state.defect_counts[defect_class] += 1
+                    state.last_alert_time[defect_class] = current_time
+                    
+                    # Reset frame counter after alert
+                    state.defect_frame_counters[defect_class] = 0
+        
+        # ============ DISPLAY & STATISTICS ============
+        
+        # Add status overlay if display enabled
+        if SHOW_DISPLAY:
+            avg_fps = state.fps_history[-1] if state.fps_history else 0
+            status = f"FPS: {avg_fps:.1f} | Inspections: {state.total_inspections} | Defects: {state.total_defects}"
+            cv2.putText(frame, status, (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow('Metal Defect Detection', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("\n👋 User pressed 'q' - stopping...")
+                break
+        
+        # Periodic statistics report
+        if current_time - state.last_stats_report > STATS_REPORT_INTERVAL:
+            report_statistics()
+            state.last_stats_report = current_time
+
+except KeyboardInterrupt:
+    print("\n\n⏸️  Keyboard interrupt received - stopping inspection...")
+
+except Exception as e:
+    print(f"\n\n❌ Error occurred: {e}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    # Cleanup
+    print("\n🔄 Shutting down system...")
+    
+    cap.release()
+    if SHOW_DISPLAY:
+        cv2.destroyAllWindows()
+    
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+    
+    # Final statistics report
+    print("\n" + "="*70)
+    print("📈 FINAL SESSION STATISTICS")
+    print("="*70)
+    print(f"Total runtime: {(time.time() - frame_start_time):.1f} seconds")
+    print(f"Total frames processed: {state.total_frames}")
+    print(f"Total inspections: {state.total_inspections}")
+    print(f"Total defects detected: {state.total_defects}")
+    
+    if state.total_inspections > 0:
+        defect_rate = (state.total_defects / state.total_inspections) * 100
+        print(f"Overall defect rate: {defect_rate:.2f}%")
+    
+    if state.fps_history:
+        avg_fps = sum(state.fps_history) / len(state.fps_history)
+        print(f"Average FPS: {avg_fps:.1f}")
+    
+    print(f"\nDefects detected by type:")
+    if state.defect_counts:
+        for defect_type, count in sorted(state.defect_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / state.total_defects * 100) if state.total_defects > 0 else 0
+            print(f"  - {defect_type}: {count} ({percentage:.1f}%)")
+    else:
+        print("  No defects detected")
+    
+    if SAVE_DEFECT_IMAGES and state.total_defects > 0:
+        print(f"\n💾 Defect images saved in: ./defect_images/")
+    
+    print("="*70)
+    print("✅ System shutdown complete")
+    print("="*70)
